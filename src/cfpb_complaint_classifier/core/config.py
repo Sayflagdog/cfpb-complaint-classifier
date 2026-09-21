@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/cfpb"
     )
+    log_level: str = "INFO"
 
 
 def get_settings() -> Settings:

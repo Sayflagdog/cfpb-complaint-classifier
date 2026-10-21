@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from starlette.concurrency import run_in_threadpool
 from starlette.responses import Response
 
 from cfpb_complaint_classifier.api import health, process, version
@@ -12,7 +11,7 @@ from cfpb_complaint_classifier.core.config import get_settings
 from cfpb_complaint_classifier.core.logging import setup_logging
 from cfpb_complaint_classifier.core.version import get_application_version
 from cfpb_complaint_classifier.db.engine import create_engine
-from cfpb_complaint_classifier.services.inference import load_registered_model
+from cfpb_complaint_classifier.messaging import create_broker, declare_topology
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +20,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     setup_logging(settings.log_level)
+    app.state.settings = settings
     app.state.db_engine = create_engine(settings)
     try:
-        app.state.model = await run_in_threadpool(load_registered_model, settings)
-        logger.info(
-            "Application started with model version %s", app.state.model.version
-        )
-        yield
+        async with create_broker(settings) as broker:
+            await declare_topology(broker, settings)
+            app.state.broker = broker
+            logger.info("Task API started")
+            yield
     finally:
         await app.state.db_engine.dispose()
         logger.info("Application stopped")

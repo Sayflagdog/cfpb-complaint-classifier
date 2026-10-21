@@ -21,6 +21,7 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.8",
+    "testcontainers[postgres,rabbitmq]>=4.15,<5",
 ]
 ml = [
     "matplotlib>=3.9,<4",
@@ -41,6 +42,7 @@ serving = [
 web = [
     "asyncpg>=0.31.0",
     "fastapi>=0.141.1",
+    "faststream[rabbit]>=0.6,<0.7",
     "pydantic-settings>=2.15.0",
     "sqlalchemy[asyncio]>=2.0.54",
     "uvicorn[standard]>=0.53.0",
@@ -50,6 +52,7 @@ web = [
 default-groups = ["web", "serving", "dev"]
 
 [tool.pytest.ini_options]
+markers = ["integration: requires Docker and isolated broker/database containers"]
 asyncio_mode = "auto"
 pythonpath = ["src", "."]
 addopts = [

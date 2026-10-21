@@ -1,4 +1,4 @@
-"""Exercise a running Compose app and restore the original champion afterward."""
+"""Exercise a running Compose worker and restore the original champion afterward."""
 
 import argparse
 import json
@@ -6,6 +6,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import requests
 from mlflow import MlflowClient
@@ -15,15 +16,29 @@ TEXT = "A debt collector keeps calling about a debt I do not owe."
 
 
 def predict(url: str) -> dict:
+    task_id = str(uuid4())
     response = requests.post(
-        f"{url.rstrip('/')}/process", json={"text": TEXT}, timeout=10
+        f"{url.rstrip('/')}/api/v1/tasks",
+        json={"text": TEXT, "task_id": task_id},
+        timeout=10,
     )
     response.raise_for_status()
-    return response.json()
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        result = requests.get(f"{url.rstrip('/')}/api/v1/tasks/{task_id}", timeout=10)
+        if result.status_code == 404:
+            time.sleep(0.5)
+            continue
+        result.raise_for_status()
+        payload = result.json()
+        return {
+            key: payload[key] for key in ("category", "model_name", "model_version")
+        }
+    raise RuntimeError(f"Task {task_id} did not complete within 120 seconds")
 
 
 def restart_and_wait(url: str, expected_version: str) -> dict:
-    subprocess.run(["docker", "compose", "restart", "app"], cwd=ROOT, check=True)  # noqa: S607
+    subprocess.run(["docker", "compose", "restart", "worker"], cwd=ROOT, check=True)  # noqa: S607
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         try:
@@ -33,7 +48,7 @@ def restart_and_wait(url: str, expected_version: str) -> dict:
         except requests.RequestException:
             pass
         time.sleep(1)
-    raise RuntimeError(f"App did not start with model version {expected_version}")
+    raise RuntimeError(f"Worker did not start with model version {expected_version}")
 
 
 def main() -> None:
@@ -72,13 +87,13 @@ def main() -> None:
     before = predict(args.app_url)
     if before["model_version"] != original or before["model_name"] != args.model_name:
         raise RuntimeError(
-            "Restart app first: its loaded model differs from the configured alias"
+            "Restart worker first: its loaded model differs from the configured alias"
         )
     try:
         client.set_registered_model_alias(args.model_name, args.alias, target)
         without_restart = predict(args.app_url)
         if without_restart != before:
-            raise RuntimeError("A running application changed its loaded model")
+            raise RuntimeError("A running worker changed its loaded model")
         after = restart_and_wait(args.app_url, target)
     finally:
         client.set_registered_model_alias(args.model_name, args.alias, original)

@@ -1,22 +1,34 @@
+x-task-environment: &task-environment
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/cfpb
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-cfpb}:${RABBITMQ_PASSWORD:-cfpb-local-password}@rabbitmq:5672/
+  TASK_QUEUE_NAME: ${TASK_QUEUE_NAME:-complaints.tasks}
+  BACKPRESSURE_ENABLED: ${BACKPRESSURE_ENABLED:-true}
+  QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-20}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+  PREFETCH_COUNT: ${PREFETCH_COUNT:-${WORKER_CONCURRENCY:-2}}
+  INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-1}
+  PUBLISH_TIMEOUT_SECONDS: ${PUBLISH_TIMEOUT_SECONDS:-1}
+  SOURCE_RETRY_INITIAL_SECONDS: ${SOURCE_RETRY_INITIAL_SECONDS:-0.05}
+  SOURCE_RETRY_MAX_SECONDS: ${SOURCE_RETRY_MAX_SECONDS:-0.5}
+  SHUTDOWN_TIMEOUT_SECONDS: ${SHUTDOWN_TIMEOUT_SECONDS:-30}
+  LOG_LEVEL: INFO
+
 services:
   app:
     build:
       context: .
     image: cfpb-complaint-classifier:local
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/cfpb
-      LOG_LEVEL: INFO
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MLFLOW_MODEL_NAME: ${MLFLOW_MODEL_NAME:-cfpb-complaint-classifier}
-      MLFLOW_MODEL_ALIAS: ${MLFLOW_MODEL_ALIAS:-champion}
-      MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD: "false"
+      <<: *task-environment
     ports:
       - "8080:8000"
     depends_on:
       postgres:
         condition: service_healthy
-      model-check:
+      db-init:
         condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
     networks:
       - cfpb
     healthcheck:
@@ -41,6 +53,95 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  worker:
+    build:
+      context: .
+    image: cfpb-complaint-classifier:local
+    command:
+      - uvicorn
+      - cfpb_complaint_classifier.worker:create_worker_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+    environment:
+      <<: *task-environment
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_MODEL_NAME: ${MLFLOW_MODEL_NAME:-cfpb-complaint-classifier}
+      MLFLOW_MODEL_ALIAS: ${MLFLOW_MODEL_ALIAS:-champion}
+      MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD: "false"
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      model-check:
+        condition: service_completed_successfully
+    networks:
+      - cfpb
+    stop_grace_period: 40s
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  source:
+    profiles: ["batch"]
+    build:
+      context: .
+    image: cfpb-complaint-classifier:local
+    entrypoint: ["python", "-m", "cfpb_complaint_classifier.source"]
+    command: ["/app/data/cfpb/test.csv", "--batch-id", "cfpb-test-v1"]
+    environment:
+      <<: *task-environment
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - cfpb
+
+  db-init:
+    build:
+      context: .
+    image: cfpb-complaint-classifier:local
+    command: ["python", "-m", "cfpb_complaint_classifier.db.tasks"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/cfpb
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - cfpb
+
+  rabbitmq:
+    image: rabbitmq:4.1.8-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-cfpb}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-cfpb-local-password}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - cfpb
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   model-check:
     build:
@@ -140,8 +241,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-local-password}
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio-data:/data
     networks:
@@ -209,6 +310,7 @@ services:
       start_period: 30s
 
 volumes:
+  rabbitmq-data:
   postgres-data:
   mlflow-db-data:
   minio-data:

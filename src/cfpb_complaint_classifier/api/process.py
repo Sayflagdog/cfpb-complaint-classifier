@@ -1,26 +1,48 @@
 import logging
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
-from starlette.concurrency import run_in_threadpool
 
-from cfpb_complaint_classifier.schemas import ProcessRequest, ProcessResponse
-from cfpb_complaint_classifier.services.inference import LoadedModel
+from cfpb_complaint_classifier.db.tasks import get_result
+from cfpb_complaint_classifier.messaging import (
+    BrokerUnavailableError,
+    QueueOverloadedError,
+    publish_task,
+)
+from cfpb_complaint_classifier.schemas import (
+    TaskAccepted,
+    TaskMessage,
+    TaskRequest,
+    TaskResult,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/process", response_model=ProcessResponse)
-async def process(payload: ProcessRequest, request: Request) -> ProcessResponse:
-    model: LoadedModel = request.app.state.model
+@router.post(
+    "/api/v1/tasks",
+    response_model=TaskAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_task(payload: TaskRequest, request: Request) -> TaskAccepted:
+    settings = request.app.state.settings
+    task = TaskMessage(**payload.model_dump())
     try:
-        category = await run_in_threadpool(model.predict, payload.text)
-    except Exception as exc:
-        logger.error("Model inference failed: %s", type(exc).__name__)
+        await publish_task(request.app.state.broker, settings, task)
+    except (QueueOverloadedError, BrokerUnavailableError) as exc:
+        logger.warning("Task publication failed: %s", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model inference is unavailable",
+            detail="Task queue is unavailable; retry with the same task_id",
+            headers={"Retry-After": str(settings.retry_after_seconds)},
         ) from None
-    return ProcessResponse(
-        category=category, model_name=model.name, model_version=model.version
-    )
+    return TaskAccepted(task_id=task.task_id)
+
+
+@router.get("/api/v1/tasks/{task_id}", response_model=TaskResult)
+async def read_task(task_id: UUID, request: Request) -> TaskResult:
+    result = await get_result(request.app.state.db_engine, task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Task is unknown or not completed")
+    return result

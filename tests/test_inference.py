@@ -1,49 +1,25 @@
+import asyncio
 import threading
 from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import mlflow
 import mlflow.sklearn
 import numpy as np
 import pytest
+from faststream.rabbit import TestRabbitBroker
 from httpx import ASGITransport, AsyncClient
 from mlflow import MlflowClient
 from mlflow.exceptions import MlflowException
 from sklearn.dummy import DummyClassifier
 from sklearn.pipeline import Pipeline
 
-from cfpb_complaint_classifier import app as app_module
+from cfpb_complaint_classifier import worker as worker_module
 from cfpb_complaint_classifier.core.config import Settings
+from cfpb_complaint_classifier.messaging import task_exchange, task_queue
+from cfpb_complaint_classifier.schemas import TaskMessage
 from cfpb_complaint_classifier.services import inference
 from cfpb_complaint_classifier.services.inference import LoadedModel
-
-
-async def test_process_returns_category_and_loaded_version(client):
-    response = await client.post(
-        "/process", json={"text": "A collector keeps calling."}
-    )
-    assert response.status_code == 200
-    assert response.json() == {
-        "category": "Debt collection",
-        "model_name": "cfpb-complaint-classifier",
-        "model_version": "7",
-    }
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {},
-        {"text": ""},
-        {"text": " \n\t "},
-        {"text": None},
-        {"text": 42},
-        {"text": ["debt"]},
-        {"text": "x" * 20001},
-        {"text": "debt", "extra": True},
-    ],
-)
-async def test_process_validates_text(client, payload):
-    assert (await client.post("/process", json=payload)).status_code == 422
 
 
 async def test_startup_loads_once_and_offloads_inference(monkeypatch):
@@ -63,17 +39,25 @@ async def test_startup_loads_once_and_offloads_inference(monkeypatch):
         return LoadedModel(pipeline, settings.mlflow_model_name, "12")
 
     loader = Mock(side_effect=load)
-    monkeypatch.setattr(app_module, "load_registered_model", loader)
-    test_app = app_module.create_app()
+    monkeypatch.setattr(worker_module, "load_registered_model", loader)
+    test_app = worker_module.create_worker_app(Settings(inference_delay_seconds=0))
+    saved = AsyncMock()
+    monkeypatch.setattr(worker_module, "save_result", saved)
+    monkeypatch.setattr(worker_module, "declare_topology", AsyncMock())
+    settings = Settings(inference_delay_seconds=0)
     async with (
+        TestRabbitBroker(test_app.state.broker) as broker,
         test_app.router.lifespan_context(test_app),
-        AsyncClient(
-            transport=ASGITransport(app=test_app), base_url="http://test"
-        ) as client,
     ):
         for _ in range(3):
-            response = await client.post("/process", json={"text": "  debt\n calls  "})
-            assert response.json()["model_version"] == "12"
+            task = TaskMessage(task_id=uuid4(), text="  debt\n calls  ")
+            await broker.publish(
+                task.model_dump(mode="json"),
+                queue=task_queue(settings),
+                exchange=task_exchange(settings),
+            )
+    assert saved.await_count == 3
+    assert saved.call_args.args[1].model_version == "12"
     loader.assert_called_once()
     assert texts_seen == [["debt calls"]] * 3
     assert all(thread != event_loop_thread for thread in worker_threads)
@@ -82,9 +66,9 @@ async def test_startup_loads_once_and_offloads_inference(monkeypatch):
 async def test_startup_failure_closes_engine(monkeypatch):
     engine = Mock(dispose=AsyncMock())
     loader = Mock(side_effect=RuntimeError("Cannot load the registered model"))
-    monkeypatch.setattr(app_module, "create_engine", lambda settings: engine)
-    monkeypatch.setattr(app_module, "load_registered_model", loader)
-    test_app = app_module.create_app()
+    monkeypatch.setattr(worker_module, "create_engine", lambda settings: engine)
+    monkeypatch.setattr(worker_module, "load_registered_model", loader)
+    test_app = worker_module.create_worker_app(Settings(inference_delay_seconds=0))
     with pytest.raises(RuntimeError, match="Cannot load the registered model"):
         async with test_app.router.lifespan_context(test_app):
             pytest.fail("Application must not start without a model")
@@ -144,14 +128,41 @@ def test_invalid_model_output_is_rejected(predictions):
         LoadedModel(pipeline, "test", "1").predict("debt")
 
 
-async def test_inference_failure_returns_503(monkeypatch, client, caplog):
-    monkeypatch.setattr(
-        LoadedModel, "predict", Mock(side_effect=ValueError("private model details"))
-    )
-    response = await client.post("/process", json={"text": "debt calls"})
-    assert response.status_code == 503
-    assert response.json() == {"detail": "Model inference is unavailable"}
-    assert "private model details" not in caplog.text
+async def test_worker_health_responds_while_predict_is_busy(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def predict(texts):
+        started.set()
+        assert release.wait(timeout=5)
+        return ["Debt collection"]
+
+    model = LoadedModel(Mock(predict=predict), "test", "1")
+    monkeypatch.setattr(worker_module, "load_registered_model", lambda settings: model)
+    monkeypatch.setattr(worker_module, "declare_topology", AsyncMock())
+    monkeypatch.setattr(worker_module, "save_result", AsyncMock())
+    settings = Settings(inference_delay_seconds=0, worker_concurrency=1)
+    app = worker_module.create_worker_app(settings)
+    async with (
+        TestRabbitBroker(app.state.broker) as broker,
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        processing = asyncio.create_task(
+            broker.publish(
+                TaskMessage(task_id=uuid4(), text="debt").model_dump(mode="json"),
+                queue=task_queue(settings),
+                exchange=task_exchange(settings),
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            response = await asyncio.wait_for(client.get("/healthz"), timeout=0.5)
+            assert response.status_code == 200
+            assert not processing.done()
+        finally:
+            release.set()
+            await processing
 
 
 async def test_real_registry_alias_changes_only_after_restart(tmp_path, monkeypatch):
@@ -188,33 +199,45 @@ async def test_real_registry_alias_changes_only_after_restart(tmp_path, monkeypa
         monkeypatch.setenv("MLFLOW_MODEL_NAME", "restart-test")
         monkeypatch.setenv("MLFLOW_MODEL_ALIAS", "champion")
         engine = Mock(dispose=AsyncMock())
-        monkeypatch.setattr(app_module, "create_engine", lambda settings: engine)
+        monkeypatch.setattr(worker_module, "create_engine", lambda settings: engine)
         loader = Mock(wraps=inference.load_registered_model)
-        monkeypatch.setattr(app_module, "load_registered_model", loader)
+        monkeypatch.setattr(worker_module, "load_registered_model", loader)
         registry.set_registered_model_alias("restart-test", "champion", versions[0])
-        first_app = app_module.create_app()
+        monkeypatch.setattr(worker_module, "declare_topology", AsyncMock())
+        saved = AsyncMock()
+        monkeypatch.setattr(worker_module, "save_result", saved)
+        settings = Settings(inference_delay_seconds=0)
+        first_app = worker_module.create_worker_app(settings)
         async with (
+            TestRabbitBroker(first_app.state.broker) as broker,
             first_app.router.lifespan_context(first_app),
-            AsyncClient(
-                transport=ASGITransport(app=first_app), base_url="http://test"
-            ) as client,
         ):
-            first = await client.post("/process", json={"text": "debt calls"})
-            assert first.json()["category"] == "Debt collection"
-            assert first.json()["model_version"] == versions[0]
+
+            async def publish():
+                await broker.publish(
+                    TaskMessage(task_id=uuid4(), text="debt calls").model_dump(
+                        mode="json"
+                    ),
+                    queue=task_queue(settings),
+                    exchange=task_exchange(settings),
+                )
+                return saved.call_args.args[1]
+
+            first = await publish()
+            assert first.category == "Debt collection"
+            assert first.model_version == versions[0]
             registry.set_registered_model_alias("restart-test", "champion", versions[1])
-            unchanged = await client.post("/process", json={"text": "debt calls"})
-            assert unchanged.json() == first.json()
-        second_app = app_module.create_app()
+            unchanged = await publish()
+            assert unchanged.model_version == first.model_version
+            assert unchanged.category == first.category
+        second_app = worker_module.create_worker_app(settings)
         async with (
+            TestRabbitBroker(second_app.state.broker) as broker,
             second_app.router.lifespan_context(second_app),
-            AsyncClient(
-                transport=ASGITransport(app=second_app), base_url="http://test"
-            ) as client,
         ):
-            second = await client.post("/process", json={"text": "debt calls"})
-            assert second.json()["category"] == "Mortgage"
-            assert second.json()["model_version"] == versions[1]
+            second = await publish()
+            assert second.category == "Mortgage"
+            assert second.model_version == versions[1]
         assert loader.call_count == 2
     finally:
         mlflow.set_tracking_uri(old_tracking)
